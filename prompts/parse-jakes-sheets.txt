@@ -1,0 +1,75 @@
+Please write me a python script that reads in an excel *.xlsx spread sheet and inserts rows into a postgres table. 
+
+This is the function I need you to use for connecting to my database:
+
+```
+import psycopg2
+def connect_to_postgres():
+    return psycopg2.connect(
+        host=os.getenv('PGHOST_2'),
+        database=os.getenv('PGDATABASE_2'),
+        user=os.getenv('PGUSER_2'),
+        password=None,  # psycopg2 will automatically use the password from ~/.pgpass
+        port=os.getenv('PGPORT_2')
+    )
+```
+
+The app should accept a parameter arg --input-file which shall be an excel spreadsheet using a very specific format.  If the format is violated please exit and print the how it's format did not follow the rules that I shall list here:
+It should also accept a parameter arg --sheet-name to be used below as the global vairable named sheet_name
+
+1. Each tab (worksheet) shall have a name that looks like this:
+
+`2025-03-31 2101-2359 State=Disa`
+
+You will be parsing this name to obtain the following variable and values:
+
+tab_date, tab_start_time, tab_end_time, tab_extra this is the template:
+
+f"{tab_date} {tab_start_time}  {tab_end_time} {tab_extra}"
+
+
+2. You should go through each worksheet and gather all the rows of data and insert these rows into the postgres table called:      `heat_data`
+
+3. The first row of each worksheet contains a header and the rest of the rows contain data.  
+
+4. Verify the header has the following names:
+
+column A:  "Date"
+column B: "Supply Temp/C"
+column C: "Return Temp/C"
+column D: "Mode"
+column E: "Request" 
+column F: "State"
+column G: "Note"
+column H: "Heating"
+column I:   "Heating_Group"
+column J:  "DateOnly"
+column K:  "TimeBlock"
+column L:  "TimeBlockState"
+
+5. For each row of data please insert a row into the the heat_data table using the following columns:
+
+6. Verify the header has the following names:
+
+column "date":  from excel column named: "Date".  store as timestamp parse as "YYYY-MM-DD HH24:MI:SS" 
+column "supply: from excel column named: "Supply Temp/C" store as float
+column "return_temp_c": from excel column named: "Return Temp/C" store as float
+column  "mode": from excel column named: "Mode" store as varchar
+column "request": from excel column named: "Request" store as varchar
+column "state": from excel column named: "State" store as varchar
+column "enabled": from excel column named: "State" store as bool set true when "State" == "Enable"
+column "note": from exel column named "Note" store as varchar
+column "heating": from exel column named "Heating" store as varchar
+column "heating_on": from exel column named "Heating" store as boolean set true when excel column is "On", false when it is other than "On"
+column "heating_group": from exel column named   "Heating_Group" store as integer
+column "date_only":from exel column named   "DateOnly" store as date
+column "time_block_start": from exel column named  "TimeBlock" parse column as "{time_block_start}-{dont-care}"
+columm "time_block_end": from exel column named "TimeBlock" parse column as "{dont-care}-{time_block_end}"
+column "timeblockstate:  from exel column named "TimeBlockState" as varchar
+column "tab_date" store as date from the tab_data parsed as describe above for each tab
+column "tab_start_time" store as postgres time parsed as describe above for each tab
+column "tab_end_time" store as postgres time parsed as describe above for each tab
+"{tab_date} {tab_start_time}  {tab_end_time} {tab_extra}"
+column "sheet_name" store as varchar assigned the global value for sheet_name described above.
+
+7. For each worksheet output to the console each time a new tab is encountered, and indicate how many rows are inserted for each tab.
