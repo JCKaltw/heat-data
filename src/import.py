@@ -18,7 +18,6 @@ def connect_to_postgres():
         port=os.getenv('PGPORT_2')
     )
 
-# We expect the following headers in columns A..L:
 EXPECTED_HEADERS = [
     "Date",
     "Supply Temp/C",
@@ -34,7 +33,6 @@ EXPECTED_HEADERS = [
     "DateTimeBlockState"
 ]
 
-# Regex for tab (worksheet) name:
 TAB_NAME_REGEX = re.compile(r'^(\d{4}-\d{2}-\d{2})\s+(\d{4})-(\d{4})\s+(.+)$')
 
 def parse_tab_name(tab_name):
@@ -90,7 +88,7 @@ def parse_tab_name(tab_name):
 def verify_header(worksheet):
     """
     Read the first row of the worksheet and ensure it matches EXPECTED_HEADERS.
-    If it doesn't match, raise ValueError with a descriptive message.
+    If it doesn't match, raise ValueError.
     """
     header_row = []
     for col_idx in range(1, len(EXPECTED_HEADERS) + 1):
@@ -131,26 +129,24 @@ def parse_time_block(time_block_value):
     return time_block_start, time_block_end
 
 
-def ensure_table_exists(conn):
+def ensure_table_exists(conn, verbose=False):
     """
-    Create the heat_data table if it does not exist.
-    Adjust column definitions to match your needs exactly.
+    Create the public.heat_data table if it does not exist.
     """
     create_table_sql = """
-    CREATE TABLE IF NOT EXISTS heat_data (
-        -- We'll define columns based on the instructions:
-        date            TIMESTAMP WITHOUT TIME ZONE,
-        supply          DOUBLE PRECISION,
-        return_temp_c   DOUBLE PRECISION,
-        mode            VARCHAR,
-        request         VARCHAR,
-        state           VARCHAR,
-        enabled         BOOLEAN,
-        note            VARCHAR,
-        heating         VARCHAR,
-        heating_on      BOOLEAN,
-        heating_group   INTEGER,
-        date_only       DATE,
+    CREATE TABLE IF NOT EXISTS public.heat_data (
+        date             TIMESTAMP WITHOUT TIME ZONE,
+        supply           DOUBLE PRECISION,
+        return_temp_c    DOUBLE PRECISION,
+        mode             VARCHAR,
+        request          VARCHAR,
+        state            VARCHAR,
+        enabled          BOOLEAN,
+        note             VARCHAR,
+        heating          VARCHAR,
+        heating_on       BOOLEAN,
+        heating_group    INTEGER,
+        date_only        DATE,
         time_block_start TIME,
         time_block_end   TIME,
         timeblockstate   VARCHAR,
@@ -160,6 +156,8 @@ def ensure_table_exists(conn):
         sheet_name       VARCHAR
     );
     """
+    if verbose:
+        print("[VERBOSE] Creating table (if not exists) with SQL:\n", create_table_sql)
     with conn.cursor() as cursor:
         cursor.execute(create_table_sql)
     conn.commit()
@@ -167,37 +165,59 @@ def ensure_table_exists(conn):
 
 def main():
     parser = argparse.ArgumentParser(description="Insert rows from Excel into PostgreSQL.")
-    parser.add_argument("--input-file", required=True, help="Path to the Excel .xlsx file.")
-    parser.add_argument("--sheet-name", required=True, help="Value to store in each row under column sheet_name.")
+    parser.add_argument("--input-file", help="Path to the Excel .xlsx file.")
+    parser.add_argument("--sheet-name", help="Value to store in each row under column sheet_name.")
+    parser.add_argument("--create-table-only", action="store_true",
+                        help="Create the heat_data table and exit (no data insertion).")
+    parser.add_argument("--verbose", action="store_true", help="Print SQL statements before executing.")
     args = parser.parse_args()
 
-    input_file = args.input_file
-    global_sheet_name = args.sheet_name
-
-    # Load the workbook
-    try:
-        wb = load_workbook(filename=input_file, data_only=True)
-    except Exception as e:
-        print(f"Failed to open the Excel file '{input_file}': {e}")
-        sys.exit(1)
-
-    # Connect to PostgreSQL
+    # 1) Connect to PostgreSQL
     try:
         conn = connect_to_postgres()
+        # Announce connection success
+        print("connect to database")
         conn.autocommit = False
     except Exception as e:
         print(f"Failed to connect to PostgreSQL: {e}")
         sys.exit(1)
 
-    try:
-        # Ensure the heat_data table exists before inserting
-        ensure_table_exists(conn)
+    # 2) Ensure the table exists
+    ensure_table_exists(conn, verbose=args.verbose)
 
+    # If --create-table-only was given, we stop here
+    if args.create_table_only:
+        print("Table creation requested, so stopping now.")
+        conn.close()
+        sys.exit(0)
+
+    # 3) Validate we have input-file and sheet-name when not create-table-only
+    if not args.input_file:
+        print("Error: --input-file is required unless --create-table-only is used.")
+        conn.close()
+        sys.exit(1)
+
+    if not args.sheet_name:
+        print("Error: --sheet-name is required unless --create-table-only is used.")
+        conn.close()
+        sys.exit(1)
+
+    # 4) Load workbook
+    try:
+        wb = load_workbook(filename=args.input_file, data_only=True)
+    except Exception as e:
+        print(f"Failed to open the Excel file '{args.input_file}': {e}")
+        conn.close()
+        sys.exit(1)
+
+    global_sheet_name = args.sheet_name
+
+    try:
         cursor = conn.cursor()
 
-        # Iterate through each worksheet/tab
+        # 5) Iterate through each worksheet in the workbook
         for sheet in wb.worksheets:
-            # 1. Parse the tab name
+            # Parse the tab name
             try:
                 tab_date, tab_start_time, tab_end_time, tab_extra = parse_tab_name(sheet.title)
             except ValueError as e:
@@ -206,7 +226,7 @@ def main():
                 conn.close()
                 sys.exit(1)
 
-            # 2. Verify header
+            # Verify the header
             try:
                 verify_header(sheet)
             except ValueError as e:
@@ -217,7 +237,7 @@ def main():
 
             rows_inserted = 0
 
-            # 3. Read data rows (starting from row 2)
+            # Read data from row 2 onward
             for row_idx in range(2, sheet.max_row + 1):
                 row_values = {
                     "Date":             sheet.cell(row=row_idx, column=1).value,
@@ -234,11 +254,11 @@ def main():
                     "TimeBlockState":   sheet.cell(row=row_idx, column=12).value,
                 }
 
-                # Skip row if the Date cell is empty/None
+                # Skip this row if date is None
                 if row_values["Date"] is None:
                     continue
 
-                # 4. Transform / parse data to match DB columns
+                # Transform / parse
                 try:
                     # date (timestamp)
                     if isinstance(row_values["Date"], datetime):
@@ -246,53 +266,52 @@ def main():
                     else:
                         date_value = datetime.strptime(str(row_values["Date"]), "%Y-%m-%d %H:%M:%S")
 
-                    # supply (float)
+                    # supply
                     supply = float(row_values["Supply Temp/C"]) if row_values["Supply Temp/C"] is not None else None
 
-                    # return_temp_c (float)
+                    # return_temp_c
                     return_temp_c = float(row_values["Return Temp/C"]) if row_values["Return Temp/C"] is not None else None
 
-                    # mode (varchar)
-                    mode_val = str(row_values["Mode"]) if row_values["Mode"] is not None else ""
+                    # mode
+                    mode_val = str(row_values["Mode"]) if row_values["Mode"] else ""
 
-                    # request (varchar)
-                    request_val = str(row_values["Request"]) if row_values["Request"] is not None else ""
+                    # request
+                    request_val = str(row_values["Request"]) if row_values["Request"] else ""
 
-                    # state (varchar)
-                    state_val = str(row_values["State"]) if row_values["State"] is not None else ""
+                    # state
+                    state_val = str(row_values["State"]) if row_values["State"] else ""
 
-                    # enabled (boolean) => true if state == "Enable"
+                    # enabled
                     enabled_val = (state_val == "Enable")
 
-                    # note (varchar)
-                    note_val = str(row_values["Note"]) if row_values["Note"] is not None else ""
+                    # note
+                    note_val = str(row_values["Note"]) if row_values["Note"] else ""
 
-                    # heating (varchar)
-                    heating_val = str(row_values["Heating"]) if row_values["Heating"] is not None else ""
+                    # heating
+                    heating_val = str(row_values["Heating"]) if row_values["Heating"] else ""
 
-                    # heating_on (boolean) => true if heating == "On"
+                    # heating_on
                     heating_on_val = (heating_val == "On")
 
-                    # heating_group (int)
+                    # heating_group
                     heating_group_val = None
                     if row_values["Heating_Group"] is not None:
                         heating_group_val = int(row_values["Heating_Group"])
 
-                    # date_only (date)
+                    # date_only
                     date_only_val = None
                     if isinstance(row_values["DateOnly"], datetime):
                         date_only_val = row_values["DateOnly"].date()
                     elif row_values["DateOnly"] is not None:
                         date_only_val = datetime.strptime(str(row_values["DateOnly"]), "%Y-%m-%d").date()
 
-                    # time_block_start, time_block_end
+                    # time_block_start / time_block_end
                     time_block_start, time_block_end = (None, None)
-                    tblock_val = row_values["TimeBlock"]
-                    if tblock_val:
-                        time_block_start, time_block_end = parse_time_block(str(tblock_val))
+                    if row_values["TimeBlock"]:
+                        time_block_start, time_block_end = parse_time_block(str(row_values["TimeBlock"]))
 
-                    # timeblockstate (varchar)
-                    timeblockstate_val = str(row_values["TimeBlockState"]) if row_values["TimeBlockState"] is not None else ""
+                    # timeblockstate
+                    timeblockstate_val = str(row_values["TimeBlockState"]) if row_values["TimeBlockState"] else ""
 
                 except ValueError as ve:
                     print(f"Row {row_idx} in sheet '{sheet.title}' - {ve}")
@@ -300,9 +319,9 @@ def main():
                     conn.close()
                     sys.exit(1)
 
-                # 5. Perform the INSERT
+                # Insert SQL
                 insert_sql = """
-                INSERT INTO heat_data (
+                INSERT INTO public.heat_data (
                     date,
                     supply,
                     return_temp_c,
@@ -325,6 +344,32 @@ def main():
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
+
+                # If verbose, print the SQL statement (and optionally the params)
+                if args.verbose:
+                    print("[VERBOSE] Executing SQL:\n", insert_sql)
+                    print("[VERBOSE] With parameters:", (
+                        date_value,
+                        supply,
+                        return_temp_c,
+                        mode_val,
+                        request_val,
+                        state_val,
+                        enabled_val,
+                        note_val,
+                        heating_val,
+                        heating_on_val,
+                        heating_group_val,
+                        date_only_val,
+                        time_block_start,
+                        time_block_end,
+                        timeblockstate_val,
+                        tab_date,
+                        tab_start_time,
+                        tab_end_time,
+                        global_sheet_name
+                    ))
+
                 try:
                     cursor.execute(
                         insert_sql,
@@ -357,10 +402,8 @@ def main():
                     conn.close()
                     sys.exit(1)
 
-            # Print how many rows we inserted for this tab
             print(f"Tab '{sheet.title}': inserted {rows_inserted} rows.")
 
-        # All good; commit
         conn.commit()
 
     finally:
