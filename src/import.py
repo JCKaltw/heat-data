@@ -18,6 +18,7 @@ def connect_to_postgres():
         port=os.getenv('PGPORT_2')
     )
 
+# Updated EXPECTED_HEADERS: the last column is now "DateTimeBlockState" instead of "TimeBlockState".
 EXPECTED_HEADERS = [
     "Date",
     "Supply Temp/C",
@@ -33,6 +34,8 @@ EXPECTED_HEADERS = [
     "DateTimeBlockState"
 ]
 
+# Regex for parsing a tab (worksheet) name of format:
+#     "YYYY-MM-DD HHMM-HHMM Extra"
 TAB_NAME_REGEX = re.compile(r'^(\d{4}-\d{2}-\d{2})\s+(\d{4})-(\d{4})\s+(.+)$')
 
 def parse_tab_name(tab_name):
@@ -88,7 +91,7 @@ def parse_tab_name(tab_name):
 def verify_header(worksheet):
     """
     Read the first row of the worksheet and ensure it matches EXPECTED_HEADERS.
-    If it doesn't match, raise ValueError.
+    If it doesn't match, raise ValueError with a descriptive message.
     """
     header_row = []
     for col_idx in range(1, len(EXPECTED_HEADERS) + 1):
@@ -117,6 +120,7 @@ def parse_time_block(time_block_value):
         s = s.strip()
         # If there's no colon, but it looks like HHMM, insert a colon
         if ':' not in s and len(s) == 4:
+            # e.g. "0800" => "08:00"
             s = s[:2] + ':' + s[2:]
         return datetime.strptime(s, "%H:%M").time()
 
@@ -132,6 +136,8 @@ def parse_time_block(time_block_value):
 def ensure_table_exists(conn, verbose=False):
     """
     Create the public.heat_data table if it does not exist.
+    
+    Added new column 'tab_full_str' before 'tab_date'.
     """
     create_table_sql = """
     CREATE TABLE IF NOT EXISTS public.heat_data (
@@ -150,6 +156,7 @@ def ensure_table_exists(conn, verbose=False):
         time_block_start TIME,
         time_block_end   TIME,
         timeblockstate   VARCHAR,
+        tab_full_str     VARCHAR,
         tab_date         DATE,
         tab_start_time   TIME,
         tab_end_time     TIME,
@@ -163,12 +170,26 @@ def ensure_table_exists(conn, verbose=False):
     conn.commit()
 
 
+def drop_table(conn, verbose=False):
+    """
+    Drop the public.heat_data table if it exists.
+    """
+    drop_table_sql = "DROP TABLE IF EXISTS public.heat_data CASCADE;"
+    if verbose:
+        print("[VERBOSE] Dropping table (if exists) with SQL:\n", drop_table_sql)
+    with conn.cursor() as cursor:
+        cursor.execute(drop_table_sql)
+    conn.commit()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Insert rows from Excel into PostgreSQL.")
     parser.add_argument("--input-file", help="Path to the Excel .xlsx file.")
     parser.add_argument("--sheet-name", help="Value to store in each row under column sheet_name.")
     parser.add_argument("--create-table-only", action="store_true",
                         help="Create the heat_data table and exit (no data insertion).")
+    parser.add_argument("--drop-table-only", action="store_true",
+                        help="Drop the heat_data table and exit (no data insertion).")
     parser.add_argument("--verbose", action="store_true", help="Print SQL statements before executing.")
     args = parser.parse_args()
 
@@ -182,27 +203,40 @@ def main():
         print(f"Failed to connect to PostgreSQL: {e}")
         sys.exit(1)
 
-    # 2) Ensure the table exists
+    # Disallow combining drop/create table
+    if args.drop_table_only and args.create_table_only:
+        print("Error: cannot use both --drop-table-only and --create-table-only simultaneously.")
+        conn.close()
+        sys.exit(1)
+
+    # 2) If user wants to drop the table only, do that and exit
+    if args.drop_table_only:
+        drop_table(conn, verbose=args.verbose)
+        print("Table drop requested, so stopping now.")
+        conn.close()
+        sys.exit(0)
+
+    # 3) Otherwise, ensure the table exists
     ensure_table_exists(conn, verbose=args.verbose)
 
-    # If --create-table-only was given, we stop here
+    # If --create-table-only was given, stop here
     if args.create_table_only:
         print("Table creation requested, so stopping now.")
         conn.close()
         sys.exit(0)
 
-    # 3) Validate we have input-file and sheet-name when not create-table-only
+    # 4) Validate we have input-file and sheet-name if inserting data
     if not args.input_file:
-        print("Error: --input-file is required unless --create-table-only is used.")
+        print("Error: --input-file is required unless --create-table-only or --drop-table-only is used.")
         conn.close()
         sys.exit(1)
 
     if not args.sheet_name:
-        print("Error: --sheet-name is required unless --create-table-only is used.")
+        print("Error: --sheet-name is required unless --create-table-only or --drop-table-only is used.")
         conn.close()
         sys.exit(1)
 
-    # 4) Load workbook
+    # 5) Load workbook
     try:
         wb = load_workbook(filename=args.input_file, data_only=True)
     except Exception as e:
@@ -215,11 +249,14 @@ def main():
     try:
         cursor = conn.cursor()
 
-        # 5) Iterate through each worksheet in the workbook
+        # 6) Iterate through each worksheet in the workbook
         for sheet in wb.worksheets:
+            # Keep the full worksheet/tab name
+            tab_full_str = sheet.title
+
             # Parse the tab name
             try:
-                tab_date, tab_start_time, tab_end_time, tab_extra = parse_tab_name(sheet.title)
+                tab_date, tab_start_time, tab_end_time, tab_extra = parse_tab_name(tab_full_str)
             except ValueError as e:
                 print(str(e))
                 conn.rollback()
@@ -240,21 +277,22 @@ def main():
             # Read data from row 2 onward
             for row_idx in range(2, sheet.max_row + 1):
                 row_values = {
-                    "Date":             sheet.cell(row=row_idx, column=1).value,
-                    "Supply Temp/C":    sheet.cell(row=row_idx, column=2).value,
-                    "Return Temp/C":    sheet.cell(row=row_idx, column=3).value,
-                    "Mode":             sheet.cell(row=row_idx, column=4).value,
-                    "Request":          sheet.cell(row=row_idx, column=5).value,
-                    "State":            sheet.cell(row=row_idx, column=6).value,
-                    "Note":             sheet.cell(row=row_idx, column=7).value,
-                    "Heating":          sheet.cell(row=row_idx, column=8).value,
-                    "Heating_Group":    sheet.cell(row=row_idx, column=9).value,
-                    "DateOnly":         sheet.cell(row=row_idx, column=10).value,
-                    "TimeBlock":        sheet.cell(row=row_idx, column=11).value,
-                    "TimeBlockState":   sheet.cell(row=row_idx, column=12).value,
+                    "Date":               sheet.cell(row=row_idx, column=1).value,
+                    "Supply Temp/C":      sheet.cell(row=row_idx, column=2).value,
+                    "Return Temp/C":      sheet.cell(row=row_idx, column=3).value,
+                    "Mode":               sheet.cell(row=row_idx, column=4).value,
+                    "Request":            sheet.cell(row=row_idx, column=5).value,
+                    "State":              sheet.cell(row=row_idx, column=6).value,
+                    "Note":               sheet.cell(row=row_idx, column=7).value,
+                    "Heating":            sheet.cell(row=row_idx, column=8).value,
+                    "Heating_Group":      sheet.cell(row=row_idx, column=9).value,
+                    "DateOnly":           sheet.cell(row=row_idx, column=10).value,
+                    "TimeBlock":          sheet.cell(row=row_idx, column=11).value,
+                    # The updated header is now "DateTimeBlockState" in column 12
+                    "DateTimeBlockState": sheet.cell(row=row_idx, column=12).value,
                 }
 
-                # Skip this row if date is None
+                # Skip this row if the Date cell is None
                 if row_values["Date"] is None:
                     continue
 
@@ -310,8 +348,9 @@ def main():
                     if row_values["TimeBlock"]:
                         time_block_start, time_block_end = parse_time_block(str(row_values["TimeBlock"]))
 
-                    # timeblockstate
-                    timeblockstate_val = str(row_values["TimeBlockState"]) if row_values["TimeBlockState"] else ""
+                    # The DB column is still called 'timeblockstate',
+                    # but now the spreadsheet header is 'DateTimeBlockState'.
+                    timeblockstate_val = str(row_values["DateTimeBlockState"]) if row_values["DateTimeBlockState"] else ""
 
                 except ValueError as ve:
                     print(f"Row {row_idx} in sheet '{sheet.title}' - {ve}")
@@ -319,7 +358,7 @@ def main():
                     conn.close()
                     sys.exit(1)
 
-                # Insert SQL
+                # Construct the INSERT statement
                 insert_sql = """
                 INSERT INTO public.heat_data (
                     date,
@@ -337,15 +376,16 @@ def main():
                     time_block_start,
                     time_block_end,
                     timeblockstate,
+                    tab_full_str,
                     tab_date,
                     tab_start_time,
                     tab_end_time,
                     sheet_name
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
 
-                # If verbose, print the SQL statement (and optionally the params)
+                # If verbose, print the SQL statement and parameters
                 if args.verbose:
                     print("[VERBOSE] Executing SQL:\n", insert_sql)
                     print("[VERBOSE] With parameters:", (
@@ -364,6 +404,7 @@ def main():
                         time_block_start,
                         time_block_end,
                         timeblockstate_val,
+                        tab_full_str,
                         tab_date,
                         tab_start_time,
                         tab_end_time,
@@ -389,6 +430,7 @@ def main():
                             time_block_start,
                             time_block_end,
                             timeblockstate_val,
+                            tab_full_str,
                             tab_date,
                             tab_start_time,
                             tab_end_time,
@@ -404,6 +446,7 @@ def main():
 
             print(f"Tab '{sheet.title}': inserted {rows_inserted} rows.")
 
+        # Commit all inserts after processing all sheets
         conn.commit()
 
     finally:
